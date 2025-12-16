@@ -7,9 +7,11 @@ This is a temporary script file.
 #-------------------------- import libraries -----------------------------------------
 import os 
 import io
+from pathlib import Path
+
 
 import time
-from datetime import datetime, timezone, date
+from datetime import datetime, date
 
 import nidaqmx
 from nidaqmx.constants import AcquisitionType, READ_ALL_AVAILABLE, TerminalConfiguration
@@ -18,7 +20,6 @@ from nidaqmx.constants import AcquisitionType, READ_ALL_AVAILABLE, TerminalConfi
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import math
 
 import multiprocessing
@@ -27,8 +28,7 @@ import multiprocessing
 import requests
 
 
-
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import urllib
 
 
@@ -38,11 +38,23 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+import win32com.client as win32
+
+
+import gc
+
+
+
+
 
 # ----------------Runtime constants/global variables ------------------ 
 #DAQ channel definition
-DEV_TMOD = "Dev1/ai0"
-DEV_TAIR = "Dev1/ai4"
+DEV_TAIR = "Dev1/ai0"
+DEV_TMOD = "Dev1/ai4"
 DEV_POA = "Dev1/ai2"
 DEV_POA2 = "Dev1/ai6"
 DEV_ALB = "Dev1/ai3"
@@ -127,6 +139,10 @@ POA2_off = 0
 GHI_off = 0
 ALB_off = 0
 
+#Temp math error flag
+Tmod_flag = 0
+Tair_flag = 0
+
 #DAQ configuration
 sampling_rate = 1000  # Samples per second
 samples_to_acquire = 10  # Number of samples to acquire
@@ -143,12 +159,13 @@ FTP_PASSWORD = 'AdamRoan$q'             #password
 
 
 local_root = 'C:/Users/phili/OneDrive/Documents/R1 Array Data/FTP_IN'   #FTP target folder
-
+pyra_offset_file = 'C:/Users/phili/OneDrive/Documents/R1 Array Data/Pyranometer_offsets.csv' #pyranometer offset daily csv
+historical_offset_file = 'C:/Users/phili/OneDrive/Documents/R1 Array Data/Historical_Pyranometer_offsets.csv' #historical pyranometer offsets
 
 #sql server credentials
 driver = '{ODBC Driver 17 for SQL Server}'
-server = 'localhost'
-database = 'R1_db'
+server = r'localhost\MSSQLSERVER01'
+database = 'R1ArrayMonitor'
 username = 'R1_import_service'
 password = 'service.py'
 params = urllib.parse.quote_plus(f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}')
@@ -158,7 +175,13 @@ Inverter_data_tb = 'R1_Inverter_data' #collects Inverter FTP data
 Producer_data_tb = 'R1_Producer_data' #collects Producer (DAQ and web scrapper) data
 
 
-
+#inverter serial number to inverter number dictionary
+inverter_mapping = {
+    '2002082591' : 'Inverter 1',
+    '2006601012' : 'Inverter 2',
+    '2007325801' : 'Inverter 3',
+    '2007325768' : 'Inverter 4'
+}
 
 #------------------------------- Function definitions ---------------------------------------------------------------------------------------
 #these are the functions used during runtime
@@ -279,8 +302,8 @@ def Inv_data_formatting():
 
 
 
-#Function that takes a dataframe and target table as input and imports the data to the target SQL table database
-def sql_dataframe_import(import_df,target_table):
+#Function that takes a dataframe and target table as input and exports the data to the target SQL table database
+def sql_dataframe_export(import_df,target_table):
     try:
         with create_engine(f'mssql+pyodbc:///?odbc_connect={params}', pool_pre_ping=True).connect() as conn:
             import_df.to_sql(target_table,con=conn,if_exists='append',index=False)
@@ -288,12 +311,198 @@ def sql_dataframe_import(import_df,target_table):
         print(e)
 
 
+
+def sql_producer_live_import(db_table, days_to_collect):
+    #live import query, no parameters needed
+    #Selects all columns from R1_producer_data sql table between current time and 3 days ago
+    try:
+        engine = create_engine(f'mssql+pyodbc:///?odbc_connect={params}', pool_pre_ping=True) #create engine
+        with engine.connect() as connection: #create connection
+            query = f"""
+            DECLARE @StartDate DATETIME = CAST(DATEADD(DAY, :days_ago_param ,GETDATE()) AS DATE);
+            SELECT * FROM {db_table}
+            WHERE [TimeStamp] >= @StartDate
+            """
+            query = text(query)
+            params_dict = {'days_ago_param' : days_to_collect}
+            df = pd.read_sql(query, connection, params=params_dict) #perform query
+            return df #return query result
+    
+    except Exception as e:
+        print(e)
+
+
+#sends an email letting the owner know this program is running
+def send_daily_notification():
+    global Tair_flag
+    global Tmod_flag
+    
+    #email message
+    html_body = f'''
+    <html>
+        <body>
+            <p>Hello,</p>
+            <p>R1 CdTe PV Array is running.</p>
+            <p>Tair flag: {Tair_flag}<p>
+            <p>Tmod flag: {Tmod_flag}<p>
+            <p>Regards,</p>
+            <p>R1ArrayMonitor</p>
+        </body>
+    </html>
+    '''
+    try:
+        #send email
+        outlook = win32.Dispatch('outlook.application')
+        mail = outlook.CreateItem(0)
+        mail.To = 'bhinojo2@rockets.utoledo.edu'
+        mail.Subject = 'R1 Array Daily Notification'
+        mail.HTMLBody = html_body
+        mail.Send()
+    except Exception as e:
+        print (e)
+
+#weekly summary email
+def send_email(db_table, days_to_collect): #table to query and days to collect
+    try:
+        Inverter_data_df = sql_producer_live_import(Inverter_data_tb, -7) #get data from the database
+        Inverter_data_df = Inverter_data_df.sort_values(by='TimeStamp', ascending=True) #sort values by time
+        Inverter_data_df['SerialNumber'] = Inverter_data_df['SerialNumber'].astype(str) 
+        Inverter_data_df['Inverter'] = Inverter_data_df['SerialNumber'].map(inverter_mapping) #make inverter column according to serial number
+        
+        Inverter_power_filtered = Inverter_data_df[Inverter_data_df['Metric'] == 'Pac'] #filter all metrics but Pac
+        Inverter_power_filtered['Date'] = Inverter_power_filtered['TimeStamp'].dt.date #make date column
+        
+        #Etotal for all inverters
+        Etotal_df = Inverter_data_df[Inverter_data_df['Metric'] == 'E-Total'] 
+        Most_recent_Etotal_df = Etotal_df.groupby('Inverter').first().reset_index() #get most recent Etotal
+        Etotal = Most_recent_Etotal_df['Mean'].sum().round(2) #sum all inverters Etotal
+        
+        #weekly kmh per inverter calculation
+        weekly_kwh_per_inverter = Inverter_power_filtered.groupby(['Inverter'])['Mean'].sum().reset_index() #sum all Pac mean values for the week
+        weekly_kwh_per_inverter['Mean'] = (weekly_kwh_per_inverter['Mean']/(1000 * 60)).round(2) #calculate kwh
+        weekly_kwh_per_inverter['Weekly Total Energy Generated'] = weekly_kwh_per_inverter['Mean'].astype(str) + ' kWh' #make string with energy and units
+        
+        weekly_total_kwh = weekly_kwh_per_inverter['Mean'].sum().round(2) #calculate weekly total kwh
+        
+        
+        weekly_kwh_per_inverter = weekly_kwh_per_inverter.drop(columns=['Mean']) #filter dataframe for email display
+        weekly_kwh_per_inverter_html = weekly_kwh_per_inverter.to_html(index=False, border=1, classes= 'dataframe') #create a html string from dataframe
+        
+        Inverter_sum = Inverter_power_filtered.groupby('TimeStamp')['Mean'].sum().reset_index() #weekly power per inverter
+        
+        daily_kwh = Inverter_sum.groupby(Inverter_sum['TimeStamp'].dt.date)['Mean'].sum().reset_index() #daily total kwh
+        
+        daily_kwh['Mean'] = (daily_kwh['Mean'] * 5 / (1000*60)).round(2) #convert to kwh
+        daily_kwh['Daily Yield'] = daily_kwh['Mean'].astype(str) + ' kWh' # add units
+        daily_kwh['Afternoon'] = pd.to_datetime(daily_kwh['TimeStamp']) + pd.to_timedelta(12, unit='h') #make afternoon timestamped column
+        
+        daily_kwh_filtered = daily_kwh.drop(columns=['Mean', 'Afternoon']) #filter for eamil display
+        daily_kwh_filtered_html = daily_kwh_filtered.to_html(index=False, border=1, classes='dataframe') # create html string for email display
+        
+        #min and max dates
+        min_date = Inverter_data_df['TimeStamp'].min().date()
+        max_date = Inverter_data_df['TimeStamp'].min().date()
+        
+        #max power
+        max_power = Inverter_sum['Mean'].max()
+        daily_kwh['Max_Power'] = max_power #create max power column
+        
+        fig_power = make_subplots(specs=[[{"secondary_y" : False}]])
+        
+        #create power graph
+        fig_power.add_trace(
+            go.Scatter(
+                x=Inverter_sum['TimeStamp'],
+                y=Inverter_sum['Mean'],
+                name='Power (W)',
+                mode='lines',
+                line=dict(color='blue', width=2)
+            ),
+            secondary_y=False
+        )
+        #create daily yield production labels
+        fig_power.add_trace(
+            go.Scatter(
+                x=daily_kwh['Afternoon'],
+                y=daily_kwh['Max_Power'],
+                name='R1 CdTe PV Array Weekly Report',
+                mode='text',
+                textposition='top center',
+                marker=dict(color='blue', size=10),
+                text=daily_kwh['Daily Yield'],
+                showlegend=False
+            ),
+            secondary_y=False
+        )      
+        #figure congig
+        fig_power.update_layout(title_text='R1 CdTe PV Array Weekly Report', title_x=0.5)
+        fig_power.update_xaxes(title_text='TimeStamp',showgrid=True)
+        fig_power.update_yaxes(title_text="<b>Power (W)</b>", showgrid=True)
+        
+        #save image
+        folder_name = r'C:/Users/phili/OneDrive/Documents/R1 Array Data/Email Attachments'
+        fig_power_name = 'Power.png'
+        power_fig_path = Path(folder_name)/fig_power_name
+        fig_power.write_image(str(power_fig_path))
+        
+        #delete figure from runtime memory
+        del fig_power
+        gc.collect()
+        
+        #email body
+        html_body = f'''
+        <html>
+            <body>
+                <p>Hello,</p>
+                <p>R1 CdTe PV Array Weekly Report for {min_date} to {max_date}.</p>
+                <p>Total Energy Generated this week: {weekly_total_kwh} kWh</p>
+                <p>Cumulative Total Energy is: {Etotal} 
+                <h3>Total Weekly Energy Generated per Inverter:</h3>
+                {weekly_kwh_per_inverter_html}
+                <h3>Daily Power Generation:</h3>
+                {daily_kwh_filtered_html}
+        
+                <p>Please find the attached power generation figure for the week.</p>
+                <p>Regards,</p>
+                <p>R1ArrayMonitor</p>
+            </body>
+        </html>
+        '''
+        #send email
+        try:
+            outlook = win32.Dispatch('outlook.application')
+            mail = outlook.CreateItem(0)
+            recipients = ['bhinojo2@rockets.utoledo.edu', 'Randy.Ellingson@utoledo.edu', 'toozie@yahoo.com', 'randy@glasscitycommunitysolar.org'] #recipients
+            mail.To = ";".join(recipients)
+            mail.Subject = 'R1 Array weekly update'
+            mail.HTMLBody = html_body
+            
+            current_dir = os.path.dirname(power_fig_path)
+            attachedment_file = os.path.join(current_dir, fig_power_name)
+            print(attachedment_file)
+            
+            if os.path.exists(attachedment_file):
+                mail.Attachments.Add(attachedment_file)
+            mail.Send()
+            print('email sent')
+        
+        except Exception as e:
+            print(f' exception: {e}')
+        
+    except Exception as e:
+        print(e)
+        
+    
+    
+
 #FTP worker combines all FTP download, formatting and uploading function to be the target of the multiprocessing thread
 #of this program. This allows the program to export inverter data to database without interrupting the data collection main thread
+#and sends an email notification that the program is running
 def FTP_worker(target_table):
     ftp_download()
-    import_df = Inv_data_formatting()
-    sql_dataframe_import(import_df, target_table)
+    export_df = Inv_data_formatting()
+    sql_dataframe_export(export_df, target_table)
+    send_daily_notification()
         
 
 
@@ -309,51 +518,61 @@ def daq_Vout(DAQ_output_voltage):
 #Function responsible to scrape data from the Sunny Webbox page where the power produced by the R1 building array is displayed
 #takes as input the url to be scrapped and the TimeStamp of the data scrapping
 def web_producer(url):
+    try:
+        with requests.Session() as session:
+            
+            response = requests.get(url) #request url response
+            producer_output_magnitude = []
+            producer_output_unit = []
+            
+            if response.status_code == 200: #if response is successful
+                data = response.json() #load url data
+                
+                
+                #Plant power data is under 'Items'
+                magnitude, unit = data['Items'][0]['Power'].split() #get Power magnitude and unit from url data
+                producer_output_magnitude.append(float(magnitude)) #convert string to float and append it to magnitude array
+                producer_output_unit.append(unit) #Power append unit to unit array
+                
+                #do the same for DailyYield....
+                magnitude, unit = data['Items'][1]['DailyYield'].split()
+                producer_output_magnitude.append(float(magnitude))
+                producer_output_unit.append(unit)
+                
+                
+                #and do the same for TotalYied....
+                magnitude, unit = data['Items'][2]['TotalYield'].split()
+                producer_output_magnitude.append(float(magnitude))
+                producer_output_unit.append(unit)
+                
+                
+                #Create a data frame with scrapped web data
+                web_producer_data = pd.DataFrame(
+                    {#'TimeStamp': [timestamp,timestamp,timestamp],
+                     'Variable':['Power', 'DailyYield', 'TotalYield'],
+                     'Magnitude':[producer_output_magnitude[0],producer_output_magnitude[1],producer_output_magnitude[2]],
+                     'Units':[producer_output_unit[0],producer_output_unit[1],producer_output_unit[2]]
+                        })
+                #web_producer_data['TimeStamp'] = pd.to_datetime(web_producer_data['TimeStamp']) #add TimeStamp
+                #return dataframe
+                return web_producer_data
     
-    response = requests.get(url) #request url response
-    producer_output_magnitude = []
-    producer_output_unit = []
-    
-    if response.status_code == 200: #if response is successful
-        data = response.json() #load url data
-        
-        
-        #Plant power data is under 'Items'
-        magnitude, unit = data['Items'][0]['Power'].split() #get Power magnitude and unit from url data
-        producer_output_magnitude.append(float(magnitude)) #convert string to float and append it to magnitude array
-        producer_output_unit.append(unit) #Power append unit to unit array
-        
-        #do the same for DailyYield....
-        magnitude, unit = data['Items'][1]['DailyYield'].split()
-        producer_output_magnitude.append(float(magnitude))
-        producer_output_unit.append(unit)
-        
-        
-        #and do the same for TotalYied....
-        magnitude, unit = data['Items'][2]['TotalYield'].split()
-        producer_output_magnitude.append(float(magnitude))
-        producer_output_unit.append(unit)
-        
-        
-        #Create a data frame with scrapped web data
-        web_producer_data = pd.DataFrame(
-            {#'TimeStamp': [timestamp,timestamp,timestamp],
-             'Variable':['Power', 'DailyYield', 'TotalYield'],
-             'Magnitude':[producer_output_magnitude[0],producer_output_magnitude[1],producer_output_magnitude[2]],
-             'Units':[producer_output_unit[0],producer_output_unit[1],producer_output_unit[2]]
-                })
-        #web_producer_data['TimeStamp'] = pd.to_datetime(web_producer_data['TimeStamp']) #add TimeStamp
-        #return dataframe
-        return web_producer_data
-
-    else: #if url connection is not successful then return a dataframe with empty values
+            else: #if url connection is not successful then return a dataframe with empty values
+                web_producer_data = pd.DataFrame(
+                    {#'TimeStamp': [timestamp],
+                     'Variable':['Power'],
+                     'Magnitude':[np.nan],
+                     'Units':[""]
+                        })
+                
+                return web_producer_data
+    except:
         web_producer_data = pd.DataFrame(
             {#'TimeStamp': [timestamp],
              'Variable':['Power'],
              'Magnitude':[np.nan],
              'Units':[""]
                 })
-        
         return web_producer_data
 
 
@@ -361,6 +580,9 @@ def web_producer(url):
 #DAQ Producer function that takes timestamp as an input
 def daq_producer(POA_offset = 0,POA2_offset = 0, GHI_offset = 0, ALB_offset = 0):
     DAQ_data_compressed = []
+    
+    global Tair_flag
+    global Tmod_flag
     
     try:
         with nidaqmx.Task() as ai_task: #create a DAQ input task
@@ -409,12 +631,19 @@ def daq_producer(POA_offset = 0,POA2_offset = 0, GHI_offset = 0, ALB_offset = 0)
             #print(DAQ_data_compressed)
             
             #Calculations
-
-            R_Tmod = (26990 + 24)/((Vex/DAQ_data_compressed[C_TMOD]) - 1) #R_Tmod Calculation
-            DAQ_data_compressed[C_TMOD] = 1/((9.376e-4) + (2.208e-4)*math.log(R_Tmod) + (1.276e-7)*math.log(R_Tmod)**3) - 273.15 #Tmod calculation
-            R_Tair = (26990 + 24)/((Vex/DAQ_data_compressed[C_TAIR]) - 1) #R_Tair Calculation
-            DAQ_data_compressed[C_TAIR] = 1/((9.376e-4) + (2.208e-4)*math.log(R_Tair) + (1.276e-7)*math.log(R_Tair)**3) - 273.15 #Tmod calculation
-            
+            try: 
+                R_Tmod = (26990 + 24)/((Vex/DAQ_data_compressed[C_TMOD]) - 1) #R_Tmod Calculation
+                DAQ_data_compressed[C_TMOD] = 1/((9.376e-4) + (2.208e-4)*math.log(R_Tmod) + (1.276e-7)*math.log(R_Tmod)**3) - 273.15 #Tmod calculation
+            except:
+                Tmod_flag = 1
+                DAQ_data_compressed[C_TMOD] = 0
+            try:
+                R_Tair = (26990 + 24)/((Vex/DAQ_data_compressed[C_TAIR]) - 1) #R_Tair Calculation
+                DAQ_data_compressed[C_TAIR] = 1/((9.376e-4) + (2.208e-4)*math.log(R_Tair) + (1.276e-7)*math.log(R_Tair)**3) - 273.15 #Tmod calculation
+            except:
+                Tair_flag = 1
+                DAQ_data_compressed = 0
+                
             DAQ_data_compressed[C_POA] = DAQ_data_compressed[C_POA]/0.00001450 + POA_offset #POA calculation
             DAQ_data_compressed[C_POA2] = DAQ_data_compressed[C_POA2]/0.00001134 + POA2_offset #POA2 calculation
             DAQ_data_compressed[C_ALB] = DAQ_data_compressed[C_ALB]/0.00001312 + ALB_offset #ALB calculation
@@ -478,6 +707,20 @@ def main():
         global GHI_off
         global ALB_off
         
+        
+        
+        offset_datatypes = { 'POA' : 'float64',
+                            'POA2' : 'float64',
+                            'GHI' : 'float64',
+                            'ALB' : 'float64'
+            }
+        
+        offset_df = pd.read_csv(pyra_offset_file, index_col=False)
+        POA_off, POA2_off, GHI_off, ALB_off = offset_df.iloc[0]
+        
+
+        
+        
         #while true
         while current_hour != 25: 
             
@@ -521,10 +764,13 @@ def main():
                     df_producers_min = df_producers_min.drop(['Units'], axis=1) #drop units from concatenated avg/max
                     df_producers_min = df_producers_min.merge(units_df, on='Variable', how='left') #add units back
                     df_producers_min['TimeStamp'] = timestamp #add timestamp
-                    df_producers_min['TimeStamp'] = pd.to_datetime(df_producers_min['TimeStamp']) #make timestamp column into a datetime column
+                    df_producers_min['TimeStamp'] = pd.to_datetime(df_producers_min['TimeStamp'], format='%Y-%m-%d %H:%M:%S') #make timestamp column into a datetime column
+                    
+    
+                    
                     
                     #save data
-                    sql_dataframe_import(df_producers_min, Producer_data_tb) #send data to database
+                    sql_dataframe_export(df_producers_min, Producer_data_tb) #send data to database
                     
                     
                     producer_file_path = producer_dir + date.today().strftime('%d%m%Y') + '.csv' #create filepath of the .csv file
@@ -538,10 +784,32 @@ def main():
                     
                     #update offsets when it's 3am
                     if datetime.now().hour == 3 and datetime.now().minute == 00:
+                     
+                        
                         POA_off = POA_off - df_producers_min.loc[df_producers_min['Variable'] == 'POA', 'Magnitude'].iloc[0] 
                         POA2_off = POA2_off - df_producers_min.loc[df_producers_min['Variable'] == 'POA2', 'Magnitude'].iloc[0]
                         GHI_off = GHI_off - df_producers_min.loc[df_producers_min['Variable'] == 'GHI', 'Magnitude'].iloc[0]
                         ALB_off = ALB_off - df_producers_min.loc[df_producers_min['Variable'] == 'ALB', 'Magnitude'].iloc[0]
+                        
+                        offset_data = {
+                            'POA': [POA2_off],
+                            'POA2': [POA2_off],
+                            'GHI': [GHI_off],
+                            'ALB': [ALB_off]
+                        }
+                        
+                        offset_df = pd.DataFrame(offset_data)
+                        offset_df.to_csv(pyra_offset_file, index=False)
+                        
+                        historical_offset_df = offset_df
+                        historical_offset_df.insert(loc=0, column='Date', value=datetime.now().strftime('%m/%d/%Y'))
+                        historical_offset_df.to_csv(historical_offset_file, mode='a', index=False, header=False)
+                        del historical_offset_df
+                    
+                    # if friday at 8pm send weekly report
+                    if datetime.now().hour == 20 and datetime.now().minute == 00 and datetime.now().weekday() == 6:
+                        send_email_process = multiprocessing.Process(target=send_email, args= (Inverter_data_tb,-7))
+                        send_email_process.start()
                         
                         
                     #if new day    
@@ -549,10 +817,8 @@ def main():
                         ftp_process = multiprocessing.Process(target=FTP_worker, args=(Inverter_data_tb,)) #create a multiprossecing stream with FTP_worker function as a target
                         ftp_process.start() #start string
                         last_day = current_day #update last day 
-                        print('new day')
+                        print(f'new day: {current_day}')
                 
-        
-        
     except KeyboardInterrupt:
         daq_Vout(DAQ_output_voltage=0)
         
@@ -562,5 +828,6 @@ if __name__ == "__main__":
     
     print('Program has started')
     main()
-                             
+
+    
 
